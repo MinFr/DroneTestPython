@@ -8,10 +8,10 @@ os.add_dll_directory(r"C:\Program Files\VideoLAN\VLC")
 from pyparrot.Bebop import Bebop
 from pyparrot.DroneVisionGUI import DroneVisionGUI
 
-mp_hands = mp.solutions.hands #solutions pour la détection des mains
-mp_draw = mp.solutions.drawing_utils # utilitaire pour dessiner les points de repère sur l'image
 
-# Définir les paramètres pour la détection des mains
+mp_hands = mp.solutions.hands
+mp_draw = mp.solutions.drawing_utils
+
 hands = mp_hands.Hands(
     max_num_hands=1,
     min_detection_confidence=0.8,
@@ -19,13 +19,48 @@ hands = mp_hands.Hands(
 )
 
 
+# Amélioration simple de l'image
+def improve_frame_quality(frame):
+    # 1. Améliorer contraste et luminosité
+    # alpha = contraste, beta = luminosité
+    frame = cv2.convertScaleAbs(frame, alpha=1.25, beta=15)
+
+    # 2. Réduction légère du bruit
+    frame = cv2.GaussianBlur(frame, (3, 3), 0)
+
+    # 3. Sharpening : rendre l'image un peu plus nette
+    sharpen_kernel = (
+        0, -1, 0,
+        -1, 5, -1,
+        0, -1, 0
+    )
+
+    kernel = cv2.UMat(
+        cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    )
+
+    # Méthode plus simple avec un vrai kernel numpy
+    import numpy as np
+    sharpen_kernel = np.array([
+        [0, -1, 0],
+        [-1, 5, -1],
+        [0, -1, 0]
+    ])
+
+    frame = cv2.filter2D(frame, -1, sharpen_kernel)
+
+    return frame
+
+
 def count_fingers(hand_landmarks):
     fingers = []
-    
-    tips = [8, 12, 16, 20] # les indices des points de repère des doigts (index, majeur, annulaire, auriculaire)
+
+    # Index, majeur, annulaire, auriculaire
+    tips = [8, 12, 16, 20]
 
     for tip in tips:
-        if hand_landmarks.landmark[tip].y < hand_landmarks.landmark[tip - 2].y: # si le point de repère est plus haut que le point de repère précédent
+        # Dans OpenCV, plus y est petit, plus le point est haut dans l'image
+        if hand_landmarks.landmark[tip].y < hand_landmarks.landmark[tip - 2].y:
             fingers.append(1)
         else:
             fingers.append(0)
@@ -34,24 +69,27 @@ def count_fingers(hand_landmarks):
 
 
 def detect_gesture_and_draw(frame):
+    # Améliorer l'image avant l'affichage et la détection
+    frame = improve_frame_quality(frame)
+
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    result = hands.process(rgb) #transformer l'image en RGB et la traiter pour détecter les mains
+    result = hands.process(rgb)
 
     gesture = "NO_HAND"
 
-    if result.multi_hand_landmarks: # si des mains sont détectées
+    if result.multi_hand_landmarks:
         for hand_landmarks in result.multi_hand_landmarks:
-            
-            mp_draw.draw_landmarks( #desinner les points de repère sur l'image
+
+            mp_draw.draw_landmarks(
                 frame,
                 hand_landmarks,
                 mp_hands.HAND_CONNECTIONS
             )
 
-            fingers = count_fingers(hand_landmarks) # compter le nombre de doigts levés
+            fingers = count_fingers(hand_landmarks)
 
             if fingers == 1:
-                gesture = "TAKEOFF" 
+                gesture = "TAKEOFF"
             elif fingers == 2:
                 gesture = "FORWARD"
             elif fingers == 3:
@@ -63,7 +101,7 @@ def detect_gesture_and_draw(frame):
             else:
                 gesture = "STOP"
 
-    cv2.putText( # afficher le geste texte détecté sur l'image
+    cv2.putText(
         frame,
         gesture,
         (30, 60),
@@ -76,45 +114,35 @@ def detect_gesture_and_draw(frame):
     return frame, gesture
 
 
-
 def user_code(drone_vision, user_args):
     last_print_time = 0
 
-    # gesture detection variables
     candidate_gesture = ""
-
-    # nombre de frames consécutifs pour confirmer le geste
     candidate_count = 0
-
-    # gesture stable variable
     stable_gesture = "NO_HAND"
 
-    # nombre de frames consécutifs pour confirmer le geste
     STABLE_FRAME_LIMIT = 5
 
-    print(" Commencer AI gesture detection")
+    print("Commencer AI gesture detection")
 
     while True:
-        frame = drone_vision.get_latest_valid_picture() # récupérer la dernière image valide de la caméra du drone
+        frame = drone_vision.get_latest_valid_picture()
 
         if frame is None:
             time.sleep(0.1)
             continue
 
-        frame_ai, detected_gesture = detect_gesture_and_draw(frame) # détecter le geste et dessiner les points de repère sur l'image
+        frame_ai, detected_gesture = detect_gesture_and_draw(frame)
 
-        # si le geste détecté est le même que le candidat précédent, on incrémente le compteur
         if detected_gesture == candidate_gesture:
             candidate_count += 1
-        else: # si le geste détecté est différent, on réinitialise le compteur et on met à jour le candidat
+        else:
             candidate_gesture = detected_gesture
             candidate_count = 1
 
-        # si le compteur atteint la limite, on met à jour le geste stable
         if candidate_count >= STABLE_FRAME_LIMIT:
             stable_gesture = candidate_gesture
 
-        # Afficher le geste stable sur l'image
         cv2.putText(
             frame_ai,
             "Stable: " + stable_gesture,
@@ -127,7 +155,6 @@ def user_code(drone_vision, user_args):
 
         now = time.time()
 
-        # Afficher le geste détecté et le geste stable toutes les 0.5 secondes
         if now - last_print_time > 0.5:
             print("Detected:", detected_gesture, "| Stable:", stable_gesture)
             last_print_time = now
@@ -142,7 +169,6 @@ def user_code(drone_vision, user_args):
     cv2.destroyAllWindows()
 
 
-
 bebop = Bebop(drone_type="Bebop2")
 
 success = bebop.connect(10)
@@ -151,12 +177,22 @@ print("Connection:", success)
 if success:
     print("Starting drone camera with AI gesture detection")
 
+    # Essayer de rendre le flux vidéo plus stable si la fonction existe
+    try:
+        if hasattr(bebop, "set_video_stream_mode"):
+            bebop.set_video_stream_mode("high_reliability")
+            print("Video stream mode: high reliability")
+        else:
+            print("set_video_stream_mode not available")
+    except Exception as e:
+        print("Could not set video stream mode:", e)
+
     bebopVision = DroneVisionGUI(
         bebop,
         is_bebop=True,
         user_code_to_run=user_code,
         user_args=None,
-        buffer_size=200
+        buffer_size=50
     )
 
     bebopVision.open_video()
