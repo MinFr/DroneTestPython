@@ -22,9 +22,14 @@ app = Flask(__name__)
 # False = mode réel : le drone peut vraiment bouger
 TEST_MODE = True
 
+# Mode actuel :
+# "manuel"    = contrôle par Android
+# "mouvement" = contrôle par gestes
+CONTROL_MODE = "manuel"
+
 # True = les gestes détectés peuvent envoyer des commandes
 # False = les gestes sont seulement affichés, sans contrôle du drone
-GESTURE_CONTROL_ENABLED = True
+GESTURE_CONTROL_ENABLED = False
 
 bebop = Bebop(drone_type="Bebop2")
 
@@ -37,6 +42,7 @@ latest_stable_gesture = "NO_HAND"
 
 frame_lock = threading.Lock()
 command_lock = threading.Lock()
+mode_lock = threading.Lock()
 
 last_command_time = 0
 COMMAND_COOLDOWN = 2.0  # secondes entre deux commandes de geste
@@ -119,7 +125,6 @@ def count_fingers(hand_landmarks, handedness_label):
     fingers = []
 
     # Pouce
-    # Attention : selon la caméra, l'effet miroir peut inverser gauche/droite.
     thumb_tip = hand_landmarks.landmark[4]
     thumb_ip = hand_landmarks.landmark[3]
 
@@ -134,7 +139,7 @@ def count_fingers(hand_landmarks, handedness_label):
         else:
             fingers.append(0)
 
-    # Autres doigts : index, majeur, annulaire, auriculaire
+    # Index, majeur, annulaire, auriculaire
     tips = [8, 12, 16, 20]
 
     for tip in tips:
@@ -217,6 +222,10 @@ def execute_drone_command(command, source="unknown"):
     """
     Fonction centrale pour exécuter une commande.
     Utilisée par Android et par la reconnaissance de gestes.
+
+    Modes :
+    - manuel    : Android contrôle le drone
+    - mouvement : les gestes contrôlent le drone
     """
 
     global connected
@@ -226,21 +235,50 @@ def execute_drone_command(command, source="unknown"):
             "ok": False,
             "error": "Drone not connected",
             "command": command,
-            "source": source
+            "source": source,
+            "mode": CONTROL_MODE
         }
 
+    with mode_lock:
+        current_mode = CONTROL_MODE
+
+    # En mode manuel, les gestes ne contrôlent pas le drone
+    if source == "gesture" and current_mode != "mouvement":
+        return {
+            "ok": False,
+            "status": "ignored",
+            "reason": "gesture command ignored because current mode is manuel",
+            "command": command,
+            "source": source,
+            "mode": current_mode
+        }
+
+    # En mode mouvement, Android ne contrôle pas le drone
+    # Exception de sécurité : land et stop restent autorisés depuis Android
+    if source == "android" and current_mode != "manuel":
+        if command not in ["land", "stop"]:
+            return {
+                "ok": False,
+                "status": "ignored",
+                "reason": "android command ignored because current mode is mouvement",
+                "command": command,
+                "source": source,
+                "mode": current_mode
+            }
+
     if TEST_MODE:
-        print(f"[TEST_MODE] {source} command received: {command}")
+        print(f"[TEST_MODE] {source} command received: {command} | mode={current_mode}")
         return {
             "ok": True,
             "status": "TEST_MODE",
             "command": command,
             "source": source,
+            "mode": current_mode,
             "message": "Command received, but drone not controlled"
         }
 
     with command_lock:
-        print(f"[REAL] {source} command: {command}")
+        print(f"[REAL] {source} command: {command} | mode={current_mode}")
 
         if command == "takeoff":
             bebop.safe_takeoff(10)
@@ -316,14 +354,16 @@ def execute_drone_command(command, source="unknown"):
                 "ok": False,
                 "error": "Unknown command",
                 "command": command,
-                "source": source
+                "source": source,
+                "mode": current_mode
             }
 
     return {
         "ok": True,
         "status": "executed",
         "command": command,
-        "source": source
+        "source": source,
+        "mode": current_mode
     }
 
 
@@ -346,10 +386,17 @@ def command_from_gesture(gesture):
 def handle_stable_gesture(stable_gesture):
     """
     Envoie une commande quand le geste est stable.
-    Ajoute un cooldown pour éviter d'envoyer 20 commandes par seconde.
+    Le contrôle par gestes fonctionne seulement en mode mouvement.
     """
 
     global last_command_time
+
+    with mode_lock:
+        current_mode = CONTROL_MODE
+
+    # Les gestes ne contrôlent le drone qu'en mode mouvement
+    if current_mode != "mouvement":
+        return
 
     if not GESTURE_CONTROL_ENABLED:
         return
@@ -364,7 +411,6 @@ def handle_stable_gesture(stable_gesture):
     if now - last_command_time < COMMAND_COOLDOWN:
         return
 
-    # On évite de répéter STOP tout le temps
     if stable_gesture in ["NO_HAND"]:
         return
 
@@ -454,13 +500,26 @@ def user_code(drone_vision, user_args):
                 2
             )
 
+            with mode_lock:
+                current_mode = CONTROL_MODE
+
+            cv2.putText(
+                frame_ai,
+                "Mode: " + current_mode,
+                (30, 300),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.9,
+                (0, 165, 255),
+                2
+            )
+
             with frame_lock:
                 latest_frame = frame_ai.copy()
 
             now = time.time()
 
             if now - last_print_time > 0.5:
-                print("Detected:", detected_gesture, "| Stable:", stable_gesture)
+                print("Detected:", detected_gesture, "| Stable:", stable_gesture, "| Mode:", current_mode)
                 last_print_time = now
 
             cv2.imshow("Drone Camera AI Gesture Detection", frame_ai)
@@ -489,6 +548,7 @@ def connect():
         "has_frame": latest_frame is not None,
         "test_mode_commands": TEST_MODE,
         "gesture_control_enabled": GESTURE_CONTROL_ENABLED,
+        "control_mode": CONTROL_MODE,
         "message": "Drone connected by main program" if connected else "Drone not connected"
     })
 
@@ -501,8 +561,53 @@ def status():
         "has_frame": latest_frame is not None,
         "test_mode_commands": TEST_MODE,
         "gesture_control_enabled": GESTURE_CONTROL_ENABLED,
+        "control_mode": CONTROL_MODE,
         "latest_gesture": latest_gesture,
         "latest_stable_gesture": latest_stable_gesture
+    })
+
+
+@app.route("/manuel", methods=["GET", "POST"])
+def set_manuel():
+    """
+    Mode manuel :
+    Android contrôle le drone.
+    Les gestes sont détectés et affichés, mais ne contrôlent pas le drone.
+    """
+    global CONTROL_MODE
+    global GESTURE_CONTROL_ENABLED
+
+    with mode_lock:
+        CONTROL_MODE = "manuel"
+        GESTURE_CONTROL_ENABLED = False
+
+    return jsonify({
+        "ok": True,
+        "control_mode": CONTROL_MODE,
+        "gesture_control_enabled": GESTURE_CONTROL_ENABLED,
+        "message": "Mode manuel activated: Android control enabled, gesture control disabled"
+    })
+
+
+@app.route("/mouvement", methods=["GET", "POST"])
+def set_mouvement():
+    """
+    Mode mouvement :
+    Les gestes contrôlent le drone.
+    Les commandes Android sont ignorées sauf land / stop pour la sécurité.
+    """
+    global CONTROL_MODE
+    global GESTURE_CONTROL_ENABLED
+
+    with mode_lock:
+        CONTROL_MODE = "mouvement"
+        GESTURE_CONTROL_ENABLED = True
+
+    return jsonify({
+        "ok": True,
+        "control_mode": CONTROL_MODE,
+        "gesture_control_enabled": GESTURE_CONTROL_ENABLED,
+        "message": "Mode mouvement activated: gesture control enabled, Android movement commands disabled"
     })
 
 
@@ -596,9 +701,14 @@ def stop():
 @app.route("/gesture/on", methods=["GET", "POST"])
 def gesture_on():
     global GESTURE_CONTROL_ENABLED
-    GESTURE_CONTROL_ENABLED = True
+    global CONTROL_MODE
+
+    with mode_lock:
+        CONTROL_MODE = "mouvement"
+        GESTURE_CONTROL_ENABLED = True
 
     return jsonify({
+        "control_mode": CONTROL_MODE,
         "gesture_control_enabled": GESTURE_CONTROL_ENABLED
     })
 
@@ -606,9 +716,14 @@ def gesture_on():
 @app.route("/gesture/off", methods=["GET", "POST"])
 def gesture_off():
     global GESTURE_CONTROL_ENABLED
-    GESTURE_CONTROL_ENABLED = False
+    global CONTROL_MODE
+
+    with mode_lock:
+        CONTROL_MODE = "manuel"
+        GESTURE_CONTROL_ENABLED = False
 
     return jsonify({
+        "control_mode": CONTROL_MODE,
         "gesture_control_enabled": GESTURE_CONTROL_ENABLED
     })
 
@@ -669,6 +784,7 @@ if __name__ == "__main__":
         video_started = True
 
         print("Starting drone camera with AI gesture detection")
+        print("Default mode: manuel")
 
         try:
             bebopVision = DroneVisionGUI(
