@@ -35,11 +35,11 @@ app = Flask(__name__)
 
 # True  = mode sécurité : les commandes sont reçues mais le drone ne bouge pas
 # False = mode réel : le drone peut vraiment bouger
-TEST_MODE = True
+TEST_MODE = False
 
 # Mode actuel :
-# "manuel"    = contrôle par Android
-# "mouvement" = contrôle par gestes
+# "manuel"     = contrôle par Android
+# "mouvement"  = contrôle par gestes
 CONTROL_MODE = "manuel"
 
 # True = les gestes détectés peuvent envoyer des commandes
@@ -59,15 +59,20 @@ frame_lock = threading.Lock()
 command_lock = threading.Lock()
 mode_lock = threading.Lock()
 
-# Cooldown pour les gestes
+# Cooldown général pour les gestes importants : takeoff / land / stop
 last_command_time = 0
 COMMAND_COOLDOWN = 2.0
+
+# Cooldown spécial pour les mouvements par gestes
+# Avant : le drone ne bougeait presque pas car 0.2 s toutes les 2 s
+GESTURE_MOVEMENT_COOLDOWN = 0.35
+GESTURE_MOVEMENT_DURATION = 0.35
 
 # Anti-accumulation pour Android
 last_android_command_time = 0
 ANDROID_COMMAND_INTERVAL = 0.15
 
-# Durée courte pour éviter que le drone continue trop longtemps
+# Durée courte pour Android, pour éviter que le drone continue trop longtemps
 MOVEMENT_DURATION = 0.20
 
 MOVEMENT_COMMANDS = ["forward", "backward", "left", "right", "up", "down"]
@@ -247,6 +252,17 @@ def detect_gesture_and_draw(frame):
 # Commandes drone communes
 # ─────────────────────────────────────────────
 
+def get_movement_duration(source):
+    """
+    Android 和手势使用不同的移动时间。
+    Android 长按会频繁发命令，所以 duration 短。
+    手势触发没那么频繁，所以 duration 稍微长一点。
+    """
+    if source == "gesture":
+        return GESTURE_MOVEMENT_DURATION
+    return MOVEMENT_DURATION
+
+
 def execute_drone_command(command, source="unknown"):
     """
     Fonction centrale pour exécuter une commande.
@@ -255,7 +271,8 @@ def execute_drone_command(command, source="unknown"):
     Protection :
     - éviter l'accumulation des commandes Android
     - ignorer les commandes de mouvement si une commande est déjà en cours
-    - réduire la durée des mouvements
+    - réduire la durée des mouvements Android
+    - rendre les mouvements par gestes plus visibles
     - console toujours autorisée pour stop / land
     """
 
@@ -344,6 +361,8 @@ def execute_drone_command(command, source="unknown"):
     try:
         print(f"[REAL] {source} command: {command} | mode={current_mode}")
 
+        movement_duration = get_movement_duration(source)
+
         if command == "takeoff":
             bebop.safe_takeoff(10)
 
@@ -356,7 +375,7 @@ def execute_drone_command(command, source="unknown"):
                 pitch=10,
                 yaw=0,
                 vertical_movement=0,
-                duration=MOVEMENT_DURATION
+                duration=movement_duration
             )
 
         elif command == "backward":
@@ -365,7 +384,7 @@ def execute_drone_command(command, source="unknown"):
                 pitch=-10,
                 yaw=0,
                 vertical_movement=0,
-                duration=MOVEMENT_DURATION
+                duration=movement_duration
             )
 
         elif command == "left":
@@ -374,7 +393,7 @@ def execute_drone_command(command, source="unknown"):
                 pitch=0,
                 yaw=0,
                 vertical_movement=0,
-                duration=MOVEMENT_DURATION
+                duration=movement_duration
             )
 
         elif command == "right":
@@ -383,7 +402,7 @@ def execute_drone_command(command, source="unknown"):
                 pitch=0,
                 yaw=0,
                 vertical_movement=0,
-                duration=MOVEMENT_DURATION
+                duration=movement_duration
             )
 
         elif command == "up":
@@ -392,7 +411,7 @@ def execute_drone_command(command, source="unknown"):
                 pitch=0,
                 yaw=0,
                 vertical_movement=10,
-                duration=MOVEMENT_DURATION
+                duration=movement_duration
             )
 
         elif command == "down":
@@ -401,7 +420,7 @@ def execute_drone_command(command, source="unknown"):
                 pitch=0,
                 yaw=0,
                 vertical_movement=-10,
-                duration=MOVEMENT_DURATION
+                duration=movement_duration
             )
 
         elif command == "stop":
@@ -460,12 +479,15 @@ def handle_stable_gesture(stable_gesture):
 
     with mode_lock:
         current_mode = CONTROL_MODE
+        gesture_enabled = GESTURE_CONTROL_ENABLED
 
-    # Les gestes ne contrôlent le drone qu'en mode mouvement
     if current_mode != "mouvement":
         return
 
-    if not GESTURE_CONTROL_ENABLED:
+    if not gesture_enabled:
+        return
+
+    if stable_gesture in ["NO_HAND"]:
         return
 
     command = command_from_gesture(stable_gesture)
@@ -475,13 +497,23 @@ def handle_stable_gesture(stable_gesture):
 
     now = time.time()
 
-    if now - last_command_time < COMMAND_COOLDOWN:
-        return
+    # Les mouvements doivent être envoyés plus souvent.
+    # takeoff / land / stop doivent rester moins fréquents.
+    if command in MOVEMENT_COMMANDS:
+        cooldown = GESTURE_MOVEMENT_COOLDOWN
+    else:
+        cooldown = COMMAND_COOLDOWN
 
-    if stable_gesture in ["NO_HAND"]:
+    if now - last_command_time < cooldown:
         return
 
     last_command_time = now
+
+    print("[GESTURE READY]")
+    print("Stable gesture:", stable_gesture)
+    print("Command:", command)
+    print("Mode:", current_mode)
+    print("Gesture enabled:", gesture_enabled)
 
     result = execute_drone_command(command, source="gesture")
     print("Gesture command result:", result)
@@ -631,7 +663,9 @@ def status():
         "control_mode": CONTROL_MODE,
         "latest_gesture": latest_gesture,
         "latest_stable_gesture": latest_stable_gesture,
-        "movement_duration": MOVEMENT_DURATION,
+        "android_movement_duration": MOVEMENT_DURATION,
+        "gesture_movement_duration": GESTURE_MOVEMENT_DURATION,
+        "gesture_movement_cooldown": GESTURE_MOVEMENT_COOLDOWN,
         "android_command_interval": ANDROID_COMMAND_INTERVAL
     })
 
@@ -818,12 +852,15 @@ def emergency_console_listener():
     """
     Console de sécurité.
     Pendant que le programme tourne, on peut taper :
-    - s / stop  : arrêt immédiat du mouvement
-    - land / l  : atterrissage immédiat
-    - mode      : afficher le mode actuel
-    - manuel    : passer en mode manuel
-    - mouvement : passer en mode mouvement
+    - s / stop   : arrêt immédiat du mouvement
+    - land / l   : atterrissage immédiat
+    - mode       : afficher le mode actuel
+    - manuel     : passer en mode manuel
+    - mouvement  : passer en mode mouvement
     """
+
+    global CONTROL_MODE
+    global GESTURE_CONTROL_ENABLED
 
     print("")
     print("Emergency console ready.")
@@ -848,9 +885,6 @@ def emergency_console_listener():
                 print(result)
 
             elif cmd == "manuel":
-                global CONTROL_MODE
-                global GESTURE_CONTROL_ENABLED
-
                 with mode_lock:
                     CONTROL_MODE = "manuel"
                     GESTURE_CONTROL_ENABLED = False
@@ -867,12 +901,15 @@ def emergency_console_listener():
             elif cmd == "mode":
                 with mode_lock:
                     current_mode = CONTROL_MODE
+                    gesture_enabled = GESTURE_CONTROL_ENABLED
 
                 print("Current mode:", current_mode)
                 print("TEST_MODE:", TEST_MODE)
-                print("GESTURE_CONTROL_ENABLED:", GESTURE_CONTROL_ENABLED)
+                print("GESTURE_CONTROL_ENABLED:", gesture_enabled)
                 print("connected:", connected)
                 print("video_started:", video_started)
+                print("latest_gesture:", latest_gesture)
+                print("latest_stable_gesture:", latest_stable_gesture)
 
             else:
                 print("Unknown console command. Use: s / stop / land / manuel / mouvement / mode")
@@ -931,7 +968,9 @@ if __name__ == "__main__":
 
         print("Starting drone camera with AI gesture detection")
         print("Default mode: manuel")
-        print("Movement duration:", MOVEMENT_DURATION)
+        print("Android movement duration:", MOVEMENT_DURATION)
+        print("Gesture movement duration:", GESTURE_MOVEMENT_DURATION)
+        print("Gesture movement cooldown:", GESTURE_MOVEMENT_COOLDOWN)
         print("Android command interval:", ANDROID_COMMAND_INTERVAL)
 
         try:
