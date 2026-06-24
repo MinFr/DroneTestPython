@@ -5,7 +5,22 @@ import cv2
 import mediapipe as mp
 import numpy as np
 
-os.add_dll_directory(r"C:\Program Files\VideoLAN\VLC")
+# ─────────────────────────────────────────────
+# VLC path
+# ─────────────────────────────────────────────
+
+vlc_paths = [
+    r"C:\Program Files\VideoLAN\VLC",
+    r"C:\Program Files (x86)\VideoLAN\VLC"
+]
+
+for vlc_path in vlc_paths:
+    if os.path.exists(vlc_path):
+        os.add_dll_directory(vlc_path)
+        print("VLC loaded from:", vlc_path)
+        break
+else:
+    print("VLC not found. If video does not work, install VLC 64-bit.")
 
 from flask import Flask, jsonify, Response
 from pyparrot.Bebop import Bebop
@@ -57,6 +72,9 @@ MOVEMENT_DURATION = 0.20
 
 MOVEMENT_COMMANDS = ["forward", "backward", "left", "right", "up", "down"]
 SAFETY_COMMANDS = ["land", "stop"]
+
+# Console de sécurité
+EMERGENCY_RUNNING = True
 
 
 # ─────────────────────────────────────────────
@@ -232,12 +250,13 @@ def detect_gesture_and_draw(frame):
 def execute_drone_command(command, source="unknown"):
     """
     Fonction centrale pour exécuter une commande.
-    Utilisée par Android et par la reconnaissance de gestes.
+    Utilisée par Android, la reconnaissance de gestes et la console de sécurité.
 
     Protection :
     - éviter l'accumulation des commandes Android
     - ignorer les commandes de mouvement si une commande est déjà en cours
     - réduire la durée des mouvements
+    - console toujours autorisée pour stop / land
     """
 
     global connected
@@ -266,8 +285,8 @@ def execute_drone_command(command, source="unknown"):
             "mode": current_mode
         }
 
-    # En mode mouvement, Android ne contrôle pas le drone
-    # Exception sécurité : land et stop restent autorisés depuis Android
+    # En mode mouvement, Android ne contrôle pas le drone.
+    # Exception sécurité : land et stop restent autorisés depuis Android.
     if source == "android" and current_mode != "manuel":
         if command not in SAFETY_COMMANDS:
             return {
@@ -279,7 +298,7 @@ def execute_drone_command(command, source="unknown"):
                 "mode": current_mode
             }
 
-    # Anti-spam Android : si Android envoie trop vite, on ignore
+    # Anti-spam Android : si Android envoie trop vite, on ignore.
     if source == "android" and command in MOVEMENT_COMMANDS:
         now = time.time()
         if now - last_android_command_time < ANDROID_COMMAND_INTERVAL:
@@ -792,6 +811,78 @@ def disconnect():
 
 
 # ─────────────────────────────────────────────
+# Console de sécurité
+# ─────────────────────────────────────────────
+
+def emergency_console_listener():
+    """
+    Console de sécurité.
+    Pendant que le programme tourne, on peut taper :
+    - s / stop  : arrêt immédiat du mouvement
+    - land / l  : atterrissage immédiat
+    - mode      : afficher le mode actuel
+    - manuel    : passer en mode manuel
+    - mouvement : passer en mode mouvement
+    """
+
+    print("")
+    print("Emergency console ready.")
+    print("Type 's' or 'stop' to stop the drone.")
+    print("Type 'land' or 'l' to land the drone.")
+    print("Type 'manuel' or 'mouvement' to change mode.")
+    print("Type 'mode' to show current mode.")
+    print("")
+
+    while EMERGENCY_RUNNING:
+        try:
+            cmd = input().strip().lower()
+
+            if cmd in ["s", "stop"]:
+                print("[EMERGENCY] STOP command sent from console")
+                result = execute_drone_command("stop", source="console")
+                print(result)
+
+            elif cmd in ["land", "l"]:
+                print("[EMERGENCY] LAND command sent from console")
+                result = execute_drone_command("land", source="console")
+                print(result)
+
+            elif cmd == "manuel":
+                global CONTROL_MODE
+                global GESTURE_CONTROL_ENABLED
+
+                with mode_lock:
+                    CONTROL_MODE = "manuel"
+                    GESTURE_CONTROL_ENABLED = False
+
+                print("[MODE] manuel activated from console")
+
+            elif cmd == "mouvement":
+                with mode_lock:
+                    CONTROL_MODE = "mouvement"
+                    GESTURE_CONTROL_ENABLED = True
+
+                print("[MODE] mouvement activated from console")
+
+            elif cmd == "mode":
+                with mode_lock:
+                    current_mode = CONTROL_MODE
+
+                print("Current mode:", current_mode)
+                print("TEST_MODE:", TEST_MODE)
+                print("GESTURE_CONTROL_ENABLED:", GESTURE_CONTROL_ENABLED)
+                print("connected:", connected)
+                print("video_started:", video_started)
+
+            else:
+                print("Unknown console command. Use: s / stop / land / manuel / mouvement / mode")
+
+        except Exception as e:
+            print("Emergency console error:", e)
+            time.sleep(0.5)
+
+
+# ─────────────────────────────────────────────
 # Flask en arrière-plan
 # ─────────────────────────────────────────────
 
@@ -814,6 +905,11 @@ if __name__ == "__main__":
     flask_thread = threading.Thread(target=run_flask)
     flask_thread.daemon = True
     flask_thread.start()
+
+    # 1.5 Lancer la console de sécurité
+    emergency_thread = threading.Thread(target=emergency_console_listener)
+    emergency_thread.daemon = True
+    emergency_thread.start()
 
     # 2. Connexion réelle au Bebop
     print("Connecting to Bebop...")
