@@ -44,8 +44,19 @@ frame_lock = threading.Lock()
 command_lock = threading.Lock()
 mode_lock = threading.Lock()
 
+# Cooldown pour les gestes
 last_command_time = 0
-COMMAND_COOLDOWN = 2.0  # secondes entre deux commandes de geste
+COMMAND_COOLDOWN = 2.0
+
+# Anti-accumulation pour Android
+last_android_command_time = 0
+ANDROID_COMMAND_INTERVAL = 0.15
+
+# Durée courte pour éviter que le drone continue trop longtemps
+MOVEMENT_DURATION = 0.20
+
+MOVEMENT_COMMANDS = ["forward", "backward", "left", "right", "up", "down"]
+SAFETY_COMMANDS = ["land", "stop"]
 
 
 # ─────────────────────────────────────────────
@@ -223,12 +234,14 @@ def execute_drone_command(command, source="unknown"):
     Fonction centrale pour exécuter une commande.
     Utilisée par Android et par la reconnaissance de gestes.
 
-    Modes :
-    - manuel    : Android contrôle le drone
-    - mouvement : les gestes contrôlent le drone
+    Protection :
+    - éviter l'accumulation des commandes Android
+    - ignorer les commandes de mouvement si une commande est déjà en cours
+    - réduire la durée des mouvements
     """
 
     global connected
+    global last_android_command_time
 
     if not connected:
         return {
@@ -254,9 +267,9 @@ def execute_drone_command(command, source="unknown"):
         }
 
     # En mode mouvement, Android ne contrôle pas le drone
-    # Exception de sécurité : land et stop restent autorisés depuis Android
+    # Exception sécurité : land et stop restent autorisés depuis Android
     if source == "android" and current_mode != "manuel":
-        if command not in ["land", "stop"]:
+        if command not in SAFETY_COMMANDS:
             return {
                 "ok": False,
                 "status": "ignored",
@@ -265,6 +278,20 @@ def execute_drone_command(command, source="unknown"):
                 "source": source,
                 "mode": current_mode
             }
+
+    # Anti-spam Android : si Android envoie trop vite, on ignore
+    if source == "android" and command in MOVEMENT_COMMANDS:
+        now = time.time()
+        if now - last_android_command_time < ANDROID_COMMAND_INTERVAL:
+            return {
+                "ok": False,
+                "status": "ignored",
+                "reason": "android command too frequent",
+                "command": command,
+                "source": source,
+                "mode": current_mode
+            }
+        last_android_command_time = now
 
     if TEST_MODE:
         print(f"[TEST_MODE] {source} command received: {command} | mode={current_mode}")
@@ -277,7 +304,25 @@ def execute_drone_command(command, source="unknown"):
             "message": "Command received, but drone not controlled"
         }
 
-    with command_lock:
+    # Si une commande de mouvement est déjà en cours,
+    # on ignore la nouvelle commande au lieu de la mettre en attente.
+    if command in MOVEMENT_COMMANDS:
+        locked = command_lock.acquire(blocking=False)
+
+        if not locked:
+            return {
+                "ok": False,
+                "status": "ignored",
+                "reason": "another movement command is already running",
+                "command": command,
+                "source": source,
+                "mode": current_mode
+            }
+    else:
+        # takeoff / land / stop attendent le verrou
+        command_lock.acquire()
+
+    try:
         print(f"[REAL] {source} command: {command} | mode={current_mode}")
 
         if command == "takeoff":
@@ -292,7 +337,7 @@ def execute_drone_command(command, source="unknown"):
                 pitch=10,
                 yaw=0,
                 vertical_movement=0,
-                duration=1
+                duration=MOVEMENT_DURATION
             )
 
         elif command == "backward":
@@ -301,7 +346,7 @@ def execute_drone_command(command, source="unknown"):
                 pitch=-10,
                 yaw=0,
                 vertical_movement=0,
-                duration=1
+                duration=MOVEMENT_DURATION
             )
 
         elif command == "left":
@@ -310,7 +355,7 @@ def execute_drone_command(command, source="unknown"):
                 pitch=0,
                 yaw=0,
                 vertical_movement=0,
-                duration=1
+                duration=MOVEMENT_DURATION
             )
 
         elif command == "right":
@@ -319,7 +364,7 @@ def execute_drone_command(command, source="unknown"):
                 pitch=0,
                 yaw=0,
                 vertical_movement=0,
-                duration=1
+                duration=MOVEMENT_DURATION
             )
 
         elif command == "up":
@@ -328,7 +373,7 @@ def execute_drone_command(command, source="unknown"):
                 pitch=0,
                 yaw=0,
                 vertical_movement=10,
-                duration=1
+                duration=MOVEMENT_DURATION
             )
 
         elif command == "down":
@@ -337,7 +382,7 @@ def execute_drone_command(command, source="unknown"):
                 pitch=0,
                 yaw=0,
                 vertical_movement=-10,
-                duration=1
+                duration=MOVEMENT_DURATION
             )
 
         elif command == "stop":
@@ -346,7 +391,7 @@ def execute_drone_command(command, source="unknown"):
                 pitch=0,
                 yaw=0,
                 vertical_movement=0,
-                duration=1
+                duration=0.1
             )
 
         else:
@@ -357,6 +402,9 @@ def execute_drone_command(command, source="unknown"):
                 "source": source,
                 "mode": current_mode
             }
+
+    finally:
+        command_lock.release()
 
     return {
         "ok": True,
@@ -563,7 +611,9 @@ def status():
         "gesture_control_enabled": GESTURE_CONTROL_ENABLED,
         "control_mode": CONTROL_MODE,
         "latest_gesture": latest_gesture,
-        "latest_stable_gesture": latest_stable_gesture
+        "latest_stable_gesture": latest_stable_gesture,
+        "movement_duration": MOVEMENT_DURATION,
+        "android_command_interval": ANDROID_COMMAND_INTERVAL
     })
 
 
@@ -785,6 +835,8 @@ if __name__ == "__main__":
 
         print("Starting drone camera with AI gesture detection")
         print("Default mode: manuel")
+        print("Movement duration:", MOVEMENT_DURATION)
+        print("Android command interval:", ANDROID_COMMAND_INTERVAL)
 
         try:
             bebopVision = DroneVisionGUI(
