@@ -3,7 +3,7 @@ from pyparrot.Bebop import Bebop
 
 app = Flask(__name__)
 
-TEST_MODE = True   # true pour le mode test, false pour le mode réel
+TEST_MODE = False  # true pour le mode test, false pour le mode réel
 
 bebop = Bebop(drone_type="Bebop2")
 connected = False
